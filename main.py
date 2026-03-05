@@ -35,7 +35,7 @@ ROW_STRIDE = 3040  # 1013 * 3 + 1 padding byte
 PIXEL_DATA_SIZE = ROW_STRIDE * CARD_HEIGHT  # 1_954_720
 
 SCB_MARKER = b"\x1bSCB="
-DEFAULT_TEMPLATE = Path(__file__).parent / "prn" / "normal.prn"
+DEFAULT_TEMPLATE = Path(__file__).parent / "files" / "normal.prn"
 
 
 # ---------------------------------------------------------------------------
