@@ -2,22 +2,26 @@
 Saturn Card Printer PRN decoder / encoder.
 
 PRN file structure (reverse-engineered):
-    ESC SOJ=<n>,Card_1-[Front] CR
+    ESC SOJ=<n>,<job_name> CR
     ESC SOP=<n>,1 CR
     ESC PDM=2512,<2512 bytes TFSM header>
     CR ESC SCP=80,<80 bytes color-panel config>
-    CR ESC SCB=<size>,<pixel data>
+    CR ESC SCB=1954720,<color pixel data>
+    CR ESC SKP=80,<80 bytes K-panel config>
+    CR ESC SKB=1954720,<K-resin pixel data>
     CR ESC EOP=<n>,1 CR
     ESC EOJ=<n>,1 CR
 
-Pixel data is 8-bit-per-channel YMC, interleaved byte-by-byte:
+Color pixel data: 8-bit-per-channel YMC, interleaved byte-by-byte:
     Y0 M0 C0  Y1 M1 C1  ...  Y1012 M1012 C1012  PAD
 Row stride = 3040 bytes  (1013 * 3 + 1 padding 0xFF).
 643 rows for a standard CR-80 card at 300 DPI.
 
+K-resin pixel data: same layout (3-byte interleaved, 3040 stride),
+all 3 channels carry the same value: 0 = K-resin, 255 = no K.
+
 Subtractive ink model: 255 = no ink (white), 0 = full ink.
-K-resin trigger: when Y=M=C=0 exactly, the printer applies K resin
-instead of mixing YMC dye.
+Where K is active, the color layer is set to 255 (no dye).
 """
 
 from __future__ import annotations
@@ -35,24 +39,40 @@ ROW_STRIDE = 3040  # 1013 * 3 + 1 padding byte
 PIXEL_DATA_SIZE = ROW_STRIDE * CARD_HEIGHT  # 1_954_720
 
 SCB_MARKER = b"\x1bSCB="
-DEFAULT_TEMPLATE = Path(__file__).parent / "files" / "normal.prn"
+SKB_MARKER = b"\x1bSKB="
+DEFAULT_TEMPLATE = Path(__file__).parent / "another-test.prn"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _find_data_after_marker(data: bytes, marker: bytes) -> int:
+    """Return the byte offset just after '<marker><length>,'."""
+    idx = data.find(marker)
+    if idx == -1:
+        return -1
+    comma = data.index(b",", idx)
+    return comma + 1
+
+
+def _deinterleave(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split a (CARD_HEIGHT, ROW_STRIDE) array into Y, M, C channels."""
+    y = raw[:, 0::3][:, :CARD_WIDTH]
+    m = raw[:, 1::3][:, :CARD_WIDTH]
+    c = raw[:, 2::3][:, :CARD_WIDTH]
+    return y, m, c
 
 
 # ---------------------------------------------------------------------------
 # Decoder
 # ---------------------------------------------------------------------------
 
-def _find_pixel_data(data: bytes) -> int:
-    """Find the byte offset where pixel data begins (just after 'ESC SCB=<len>,')."""
-    idx = data.find(SCB_MARKER)
-    if idx == -1:
-        raise ValueError("No ESC SCB= command found in file")
-    comma = data.index(b",", idx)
-    return comma + 1
-
-
 def decode_prn(prn_path: str | Path) -> dict:
     """Decode a Saturn PRN file into a color image and K-layer mask.
+
+    Supports both old format (color only, K inferred from YMC=0) and
+    new format (separate SKB K-layer block).
 
     Returns a dict with:
         "color"  : PIL.Image  RGB  (YMC converted to RGB)
@@ -64,23 +84,32 @@ def decode_prn(prn_path: str | Path) -> dict:
     with open(prn_path, "rb") as f:
         data = f.read()
 
-    offset = _find_pixel_data(data)
-    pixel_bytes = data[offset : offset + PIXEL_DATA_SIZE]
-    if len(pixel_bytes) < PIXEL_DATA_SIZE:
+    color_offset = _find_data_after_marker(data, SCB_MARKER)
+    if color_offset == -1:
+        raise ValueError("No ESC SCB= command found in file")
+    color_bytes = data[color_offset : color_offset + PIXEL_DATA_SIZE]
+    if len(color_bytes) < PIXEL_DATA_SIZE:
         raise ValueError(
-            f"File too small: expected {PIXEL_DATA_SIZE} bytes of pixel data "
-            f"at offset 0x{offset:X}, got {len(pixel_bytes)}"
+            f"File too small: expected {PIXEL_DATA_SIZE} bytes of color data "
+            f"at offset 0x{color_offset:X}, got {len(color_bytes)}"
         )
 
-    raw = np.frombuffer(pixel_bytes, dtype=np.uint8).reshape(CARD_HEIGHT, ROW_STRIDE)
+    raw_color = np.frombuffer(color_bytes, dtype=np.uint8).reshape(
+        CARD_HEIGHT, ROW_STRIDE
+    )
+    y_chan, m_chan, c_chan = _deinterleave(raw_color)
 
-    y_chan = raw[:, 0::3][:, :CARD_WIDTH]
-    m_chan = raw[:, 1::3][:, :CARD_WIDTH]
-    c_chan = raw[:, 2::3][:, :CARD_WIDTH]
+    k_offset = _find_data_after_marker(data, SKB_MARKER)
+    if k_offset != -1:
+        k_bytes = data[k_offset : k_offset + PIXEL_DATA_SIZE]
+        raw_k = np.frombuffer(k_bytes, dtype=np.uint8).reshape(
+            CARD_HEIGHT, ROW_STRIDE
+        )
+        k_ch, _, _ = _deinterleave(raw_k)
+        k_mask = k_ch == 0
+    else:
+        k_mask = (y_chan == 0) & (m_chan == 0) & (c_chan == 0)
 
-    k_mask = (y_chan == 0) & (m_chan == 0) & (c_chan == 0)
-
-    # Subtractive to RGB: Cyan→R, Magenta→G, Yellow→B
     color_img = Image.fromarray(
         np.stack([c_chan, m_chan, y_chan], axis=2), mode="RGB"
     )
@@ -122,22 +151,32 @@ def save_decoded(prn_path: str | Path, output_dir: str | Path | None = None) -> 
 # Encoder
 # ---------------------------------------------------------------------------
 
-def _load_template(template_prn: str | Path) -> bytes:
-    """Extract the static middle block from a template PRN.
+def _load_template(template_prn: str | Path) -> dict:
+    """Extract the static blocks from a template PRN.
 
-    The middle block spans from ``ESC PDM=...`` through the comma after
-    ``ESC SCB=1954720,``.  It is identical across print jobs regardless of
-    job ID.
+    Returns a dict with:
+        "color_preamble" : bytes from ESC PDM through the comma after SCB=<size>,
+        "k_preamble"     : bytes from CR ESC SKP through the comma after SKB=<size>,
+                           (empty bytes if template has no K layer)
     """
     template_prn = Path(template_prn)
     with open(template_prn, "rb") as f:
         data = f.read()
 
-    # Find the start of ESC PDM (first ESC after SOP)
     sop_end = data.index(b"\r", data.index(b"\x1bSOP=")) + 1
-    pixel_start = _find_pixel_data(data)
+    color_pixel_start = _find_data_after_marker(data, SCB_MARKER)
 
-    return data[sop_end:pixel_start]
+    k_pixel_start = _find_data_after_marker(data, SKB_MARKER)
+    if k_pixel_start != -1:
+        color_pixel_end = color_pixel_start + PIXEL_DATA_SIZE
+        k_preamble = data[color_pixel_end:k_pixel_start]
+    else:
+        k_preamble = b""
+
+    return {
+        "color_preamble": data[sop_end:color_pixel_start],
+        "k_preamble": k_preamble,
+    }
 
 
 def _prepare_image(image_path: str | Path) -> np.ndarray:
@@ -163,41 +202,43 @@ def _prepare_image(image_path: str | Path) -> np.ndarray:
     return np.array(img, dtype=np.uint8)
 
 
-def _rgb_to_ymc(rgb: np.ndarray, k_threshold: int = 30) -> np.ndarray:
-    """Convert an RGB image array to interleaved YMC pixel data.
+def _interleave_ymc(y: np.ndarray, m: np.ndarray, c: np.ndarray) -> np.ndarray:
+    """Pack Y, M, C channel arrays into a (CARD_HEIGHT, ROW_STRIDE) buffer."""
+    out = np.full((CARD_HEIGHT, ROW_STRIDE), 0xFF, dtype=np.uint8)
+    out[:, 0::3][:, :CARD_WIDTH] = y
+    out[:, 1::3][:, :CARD_WIDTH] = m
+    out[:, 2::3][:, :CARD_WIDTH] = c
+    return out
 
-    Channel values map directly to RGB light intensity (no inversion needed):
-      Y_channel = B,  M_channel = G,  C_channel = R
-    (255 = no ink = full light, 0 = full ink = light absorbed)
 
-    Pixels where max(R,G,B) < k_threshold are set to Y=M=C=0 (K-resin trigger).
-    Returns a flat bytes-ready array of shape (CARD_HEIGHT, ROW_STRIDE).
+def _rgb_to_layers(
+    rgb: np.ndarray, k_threshold: int = 30
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert an RGB image to separate color and K-resin layers.
+
+    Returns (color_data, k_data) each shaped (CARD_HEIGHT, ROW_STRIDE).
+    Where K is active: color = 255 (no dye), K = 0 (apply resin).
+    Where K is inactive: color = YMC values, K = 255.
     """
     y = rgb[:, :, 2].copy()  # B -> Y channel
     m = rgb[:, :, 1].copy()  # G -> M channel
     c = rgb[:, :, 0].copy()  # R -> C channel
 
     if k_threshold > 0:
-        # K-resin: force Y=M=C=0 for near-black pixels
         is_k = np.max(rgb, axis=2) < k_threshold
-        y[is_k] = 0
-        m[is_k] = 0
-        c[is_k] = 0
+        y[is_k] = 255
+        m[is_k] = 255
+        c[is_k] = 255
     else:
-        # K disabled: clamp so Y=M=C never hits exact (0,0,0),
-        # which would accidentally trigger K-resin.
-        all_zero = (y == 0) & (m == 0) & (c == 0)
-        y[all_zero] = 1
-        m[all_zero] = 1
-        c[all_zero] = 1
+        is_k = np.zeros((CARD_HEIGHT, CARD_WIDTH), dtype=bool)
 
-    # Interleave into row-stride format: Y0 M0 C0  Y1 M1 C1 ... PAD
-    out = np.full((CARD_HEIGHT, ROW_STRIDE), 0xFF, dtype=np.uint8)
-    out[:, 0::3][:, :CARD_WIDTH] = y
-    out[:, 1::3][:, :CARD_WIDTH] = m
-    out[:, 2::3][:, :CARD_WIDTH] = c
+    color_data = _interleave_ymc(y, m, c)
 
-    return out
+    k_val = np.full((CARD_HEIGHT, CARD_WIDTH), 255, dtype=np.uint8)
+    k_val[is_k] = 0
+    k_data = _interleave_ymc(k_val, k_val, k_val)
+
+    return color_data, k_data
 
 
 def build_prn(
@@ -214,6 +255,7 @@ def build_prn(
         image_path:   Source image (PNG, JPEG, etc.).
         output_path:  Destination .prn file.
         k_threshold:  Pixels with max(R,G,B) below this value trigger K resin.
+                      Set to 0 to disable K entirely.
         template_prn: Template PRN to extract the static header from.
         job_id:       Job ID number for the ESC commands.
 
@@ -225,16 +267,13 @@ def build_prn(
     template_prn = Path(template_prn)
     output_path = Path(output_path)
 
-    middle_block = _load_template(template_prn)
+    tpl = _load_template(template_prn)
 
     rgb = _prepare_image(image_path)
-    pixel_data = _rgb_to_ymc(rgb, k_threshold=k_threshold)
+    color_data, k_data = _rgb_to_layers(rgb, k_threshold=k_threshold)
 
-    # Count K pixels from the interleaved data (skip padding byte per row)
-    y_out = pixel_data[:, 0::3][:, :CARD_WIDTH]
-    m_out = pixel_data[:, 1::3][:, :CARD_WIDTH]
-    c_out = pixel_data[:, 2::3][:, :CARD_WIDTH]
-    k_count = int(np.sum((y_out == 0) & (m_out == 0) & (c_out == 0)))
+    k_ch = k_data[:, 0::3][:, :CARD_WIDTH]
+    k_count = int(np.sum(k_ch == 0))
 
     header = (
         f"\x1bSOJ={job_id},Card_1-[Front]\r"
@@ -248,8 +287,11 @@ def build_prn(
 
     with open(output_path, "wb") as f:
         f.write(header)
-        f.write(middle_block)
-        f.write(pixel_data.tobytes())
+        f.write(tpl["color_preamble"])
+        f.write(color_data.tobytes())
+        if tpl["k_preamble"]:
+            f.write(tpl["k_preamble"])
+            f.write(k_data.tobytes())
         f.write(trailer)
 
     total = CARD_WIDTH * CARD_HEIGHT
