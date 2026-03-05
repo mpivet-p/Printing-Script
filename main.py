@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from tkinter import W
 
 import numpy as np
 from PIL import Image
@@ -40,7 +41,7 @@ PIXEL_DATA_SIZE = ROW_STRIDE * CARD_HEIGHT  # 1_954_720
 
 SCB_MARKER = b"\x1bSCB="
 SKB_MARKER = b"\x1bSKB="
-DEFAULT_TEMPLATE = Path(__file__).parent / "another-test.prn"
+DEFAULT_TEMPLATE = Path(__file__).parent / "files" / "template.prn"
 
 
 # ---------------------------------------------------------------------------
